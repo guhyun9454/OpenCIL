@@ -403,7 +403,7 @@ class OODVILBERExperiment:
             self.model.aux_head.parameters(),
             lr=args.ber_lr,
             momentum=0.9,
-            weight_decay=args.weight_decay,
+            weight_decay=args.ber_weight_decay,
         )
         self.ber_scheduler = (
             torch.optim.lr_scheduler.CosineAnnealingLR(self.ber_optimizer, T_max=args.ber_epochs) if args.use_scheduler else None
@@ -811,8 +811,10 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # training
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--ber_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=64)
+    # 논문 설정(추가 분류기 fine-tuning): 10 epochs
+    parser.add_argument("--ber_epochs", type=int, default=10)
+    # 논문 설정: batch size 128
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--print_freq", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -821,17 +823,25 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # optimizer
     parser.add_argument("--base_lr", type=float, default=5e-5)
-    parser.add_argument("--ber_lr", type=float, default=1e-2)
+    # 논문 설정(추가 분류기 SGD): lr 0.1
+    parser.add_argument("--ber_lr", type=float, default=0.1)
+    # base(ID) 학습용 weight decay (기존 기본값 유지)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--use_scheduler", action="store_true")
+    # BER(aux) fine-tuning용 weight decay (논문: 0.0005)
+    parser.add_argument("--ber_weight_decay", type=float, default=5e-4)
+    # 논문 설정: Cosine Annealing 사용(기본 True)
+    parser.add_argument("--use_scheduler", dest="use_scheduler", action="store_true", help="Cosine annealing scheduler 사용")
+    parser.add_argument("--no_scheduler", dest="use_scheduler", action="store_false", help="Scheduler 비활성화")
+    parser.set_defaults(use_scheduler=True)
 
     # BER hyperparams
+    # 논문 기본값
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--tau", type=float, default=1.0)
-    parser.add_argument("--p_in", type=float, default=-10.0)
-    parser.add_argument("--p_out", type=float, default=-5.0)
+    parser.add_argument("--p_in", type=float, default=-5.0)
+    parser.add_argument("--p_out", type=float, default=-27.0)
     parser.add_argument("--ber_beta", type=float, default=1.0, help="Beta(ber_beta, ber_beta) for NTER mixup.")
-    parser.add_argument("--oter_lambda", type=float, default=0.002, help="OTER mixup coefficient lambda.")
+    parser.add_argument("--oter_lambda", type=float, default=0.0022, help="OTER mixup coefficient lambda.")
 
     # replay buffer (bytes)
     parser.add_argument("--replay_buffer_bytes", type=parse_bytes, default=0, help="예: 1048576, 512MB, 2GB")

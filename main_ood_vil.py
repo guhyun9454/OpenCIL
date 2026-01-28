@@ -41,6 +41,11 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def develop_break(batch_idx: int, args: argparse.Namespace) -> bool:
+    """--develop 모드: 1 batch만 처리."""
+    return bool(getattr(args, "develop", False)) and batch_idx >= 1
+
+
 def tensor_total_bytes(t: torch.Tensor) -> int:
     # 요구사항: Total Bytes = tensor.element_size() * tensor.nelement()
     return int(t.element_size() * t.nelement())
@@ -348,7 +353,7 @@ def compute_ood_scores(
     def _scores(loader: torch.utils.data.DataLoader, use_aux: bool) -> torch.Tensor:
         scores: List[torch.Tensor] = []
         for batch_idx, (inputs, _) in enumerate(loader):
-            if args.develop and batch_idx > 20:
+            if develop_break(batch_idx, args):
                 break
             inputs = inputs.to(device)
 
@@ -433,7 +438,7 @@ class OODVILBERExperiment:
         total_samples = 0
 
         for batch_idx, (inputs, targets) in enumerate(data_loader):
-            if args.develop and batch_idx > 20:
+            if develop_break(batch_idx, args):
                 break
 
             inputs = inputs.to(device)
@@ -488,7 +493,7 @@ class OODVILBERExperiment:
         beta_dist = torch.distributions.beta.Beta(args.ber_beta, args.ber_beta)
 
         for batch_idx, (inputs, targets) in enumerate(data_loader):
-            if args.develop and batch_idx > 20:
+            if develop_break(batch_idx, args):
                 break
 
             inputs = inputs.to(device)
@@ -693,7 +698,7 @@ class OODVILBERExperiment:
 
         with torch.no_grad():
             for batch_idx, (inputs, targets) in enumerate(data_loader):
-                if args.develop and batch_idx > 20:
+                if develop_break(batch_idx, args):
                     break
 
                 inputs = inputs.to(device)
@@ -856,6 +861,12 @@ def main() -> None:
     _user_verbose = bool(args.verbose)
     args = set_data_config(args)
     seed_everything(args.seed)
+
+    # develop 모드: 1 epoch + 1 batch만 돌도록 강제
+    if args.develop:
+        args.epochs = 1
+        args.ber_epochs = 1
+        args.buffer_update_batches = 1
 
     # output dir
     os.makedirs(args.output_dir, exist_ok=True)

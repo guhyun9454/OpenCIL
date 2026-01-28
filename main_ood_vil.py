@@ -446,10 +446,14 @@ class OODVILBERExperiment:
 
             # replay (old tasks)
             if args.replay_batch_size > 0 and len(self.replay) > 0:
-                n_rep = min(args.replay_batch_size, len(self.replay), inputs.size(0))
+                # 총 배치 크기가 커지면 ViT 메모리 사용량이 급증하므로,
+                # "현재 배치 일부를 replay로 교체"하여 항상 batch_size를 유지합니다.
+                n_total = inputs.size(0)
+                n_rep = min(args.replay_batch_size, len(self.replay), n_total)
                 rep_x, rep_y = self.replay.sample(n_rep)
-                inputs_all = torch.cat([inputs, rep_x], dim=0)
-                targets_all = torch.cat([targets, rep_y], dim=0)
+                n_new = n_total - n_rep
+                inputs_all = torch.cat([inputs[:n_new], rep_x], dim=0)
+                targets_all = torch.cat([targets[:n_new], rep_y], dim=0)
             else:
                 inputs_all, targets_all = inputs, targets
 
@@ -501,10 +505,13 @@ class OODVILBERExperiment:
 
             # === CE term on (new + replay) ===
             if args.replay_batch_size > 0 and len(self.replay) > 0:
-                n_rep = min(args.replay_batch_size, len(self.replay), inputs.size(0))
+                # base와 동일하게 총 배치 크기를 유지
+                n_total = inputs.size(0)
+                n_rep = min(args.replay_batch_size, len(self.replay), n_total)
                 rep_x, rep_y = self.replay.sample(n_rep)
-                inputs_all = torch.cat([inputs, rep_x], dim=0)
-                targets_all = torch.cat([targets, rep_y], dim=0)
+                n_new = n_total - n_rep
+                inputs_all = torch.cat([inputs[:n_new], rep_x], dim=0)
+                targets_all = torch.cat([targets[:n_new], rep_y], dim=0)
             else:
                 inputs_all, targets_all = inputs, targets
 
@@ -638,6 +645,10 @@ class OODVILBERExperiment:
             )
             if args.verbose:
                 print(f"[Replay] total_bytes={self.replay.total_bytes} bytes | n_samples={len(self.replay)}")
+
+            # 다음 task로 넘어가기 전에 캐시 정리 (OOM/fragmentation 완화)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     def evaluate_till_now(
         self,

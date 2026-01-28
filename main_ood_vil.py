@@ -804,7 +804,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # data / scenario
     parser.add_argument("--dataset", type=str, default="iDigits", choices=["iDigits", "DomainNet", "CORe50", "CLEAR"])
-    parser.add_argument("--data_path", type=str, default="./data")
+    parser.add_argument("--data_path", type=str, default="/local_datasets")
     parser.add_argument("--IL_mode", type=str, default="vil", choices=["cil", "dil", "vil", "joint"])
     parser.add_argument("--num_tasks", type=int, default=20, help="VIL에서는 num_domains로 나누어 떨어져야 합니다.")
     parser.add_argument("--shuffle", action="store_true", help="class split 시 클래스 순서를 섞습니다.")

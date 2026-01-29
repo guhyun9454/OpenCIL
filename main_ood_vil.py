@@ -313,7 +313,7 @@ def save_anomaly_histogram(
     args: argparse.Namespace,
     suffix: str = "",
     task_id: Optional[int] = None,
-) -> str:
+) -> Optional[str]:
     import matplotlib.pyplot as plt
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -321,6 +321,13 @@ def save_anomaly_histogram(
     tag = f"_task_{tid:03d}" if tid >= 0 else ""
     suf = f"_{suffix}" if suffix else ""
     out_path = os.path.join(args.output_dir, f"anomaly_hist{suf}{tag}.png")
+
+    id_scores = np.asarray(id_scores, dtype=np.float64)
+    ood_scores = np.asarray(ood_scores, dtype=np.float64)
+    id_scores = id_scores[np.isfinite(id_scores)]
+    ood_scores = ood_scores[np.isfinite(ood_scores)]
+    if id_scores.size == 0 or ood_scores.size == 0:
+        return None
 
     plt.figure(figsize=(7, 4))
     plt.hist(id_scores, bins=50, alpha=0.6, label="ID", density=True)
@@ -394,20 +401,32 @@ class OODVILBERExperiment:
         # base(ID) optimizer: backbone + head (aux_head 제외)
         base_params = list(self.model.backbone.parameters()) + list(self.model.head.parameters())
         self.base_optimizer = torch.optim.AdamW(base_params, lr=args.base_lr, weight_decay=args.weight_decay)
-        self.base_scheduler = (
-            torch.optim.lr_scheduler.CosineAnnealingLR(self.base_optimizer, T_max=args.epochs) if args.use_scheduler else None
-        )
+        self.base_scheduler = None
+        self.ber_optimizer = None
+        self.ber_scheduler = None
+        self._reset_base_scheduler(args)
+        self._reset_ber_optimizer(args)
 
-        # BER optimizer: aux_head only
+    def _reset_base_scheduler(self, args: argparse.Namespace) -> None:
+        if args.use_scheduler:
+            t_max = max(int(args.epochs), 1)
+            self.base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.base_optimizer, T_max=t_max)
+        else:
+            self.base_scheduler = None
+
+    def _reset_ber_optimizer(self, args: argparse.Namespace) -> None:
+        # task마다 aux_head를 head에서 복사(sync)하기 때문에 optimizer state(momentum buffer)를 같이 리셋해야 안정적입니다.
         self.ber_optimizer = torch.optim.SGD(
             self.model.aux_head.parameters(),
             lr=args.ber_lr,
             momentum=0.9,
             weight_decay=args.ber_weight_decay,
         )
-        self.ber_scheduler = (
-            torch.optim.lr_scheduler.CosineAnnealingLR(self.ber_optimizer, T_max=args.ber_epochs) if args.use_scheduler else None
-        )
+        if args.use_scheduler:
+            t_max = max(int(args.ber_epochs), 1)
+            self.ber_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.ber_optimizer, T_max=t_max)
+        else:
+            self.ber_scheduler = None
 
     def _set_train_mode(self, *, train_backbone: bool, train_head: bool, train_aux: bool) -> None:
         for p in self.model.backbone.parameters():
@@ -549,8 +568,30 @@ class OODVILBERExperiment:
 
             loss = loss_clf + float(args.alpha) * (loss_n + loss_o)
 
+            # 비정상 loss 방지 (inf/nan 발생 시 optimizer step을 건너뜁니다)
+            if not torch.isfinite(loss).item():
+                if args.verbose:
+                    print(f"[BER ] Non-finite loss detected (epoch={epoch+1}, batch={batch_idx}). Skip step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            if getattr(args, "ber_grad_clip", 0.0) and float(args.ber_grad_clip) > 0:
+                torch.nn.utils.clip_grad_norm_(model.aux_head.parameters(), float(args.ber_grad_clip))
+
+            grads_ok = True
+            for p in model.aux_head.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grads_ok = False
+                    break
+            if not grads_ok:
+                if args.verbose:
+                    print(f"[BER ] Non-finite gradients detected (epoch={epoch+1}, batch={batch_idx}). Skip step.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             optimizer.step()
 
             acc1 = accuracy(aux_logits, targets_all, topk=(1,))[0].item()
@@ -586,6 +627,7 @@ class OODVILBERExperiment:
             # ------------------------------
             # (A) Base(ID) incremental train
             # ------------------------------
+            self._reset_base_scheduler(args)
             for epoch in range(args.epochs):
                 epoch_start = time.time()
                 epoch_avg_loss, epoch_avg_acc = self.train_one_epoch_base(
@@ -597,12 +639,13 @@ class OODVILBERExperiment:
                     f"Avg Loss = {epoch_avg_loss:.4f}, Avg Acc@1 = {epoch_avg_acc:.2f}"
                 )
                 if self.base_scheduler is not None:
-                    self.base_scheduler.step(epoch)
+                    self.base_scheduler.step()
 
             # ---------------------------------------
             # (B) BER train (freeze base, train aux)
             # ---------------------------------------
             model.sync_aux_from_head()
+            self._reset_ber_optimizer(args)
             for epoch in range(args.ber_epochs):
                 epoch_start = time.time()
                 epoch_avg_loss, epoch_avg_acc = self.train_one_epoch_ber(
@@ -614,7 +657,7 @@ class OODVILBERExperiment:
                     f"Avg Loss = {epoch_avg_loss:.4f}, Avg Acc@1 = {epoch_avg_acc:.2f}"
                 )
                 if self.ber_scheduler is not None:
-                    self.ber_scheduler.step(epoch)
+                    self.ber_scheduler.step()
 
             train_duration = time.time() - train_start
             print(f"Task {task_id+1} training completed in {str(datetime.timedelta(seconds=int(train_duration)))}")
@@ -786,13 +829,20 @@ class OODVILBERExperiment:
 
             if args.verbose or args.wandb:
                 hist_path = save_anomaly_histogram(id_scores.numpy(), ood_scores.numpy(), args, suffix=method.lower(), task_id=task_id)
-                if args.wandb:
+                if args.wandb and hist_path is not None:
                     import wandb
 
                     wandb.log({f"Anomaly Histogram TASK {task_id}": wandb.Image(hist_path)})
 
             binary_labels = np.concatenate([np.ones(id_scores.shape[0]), np.zeros(ood_scores.shape[0])])
             all_scores = np.concatenate([id_scores.numpy(), ood_scores.numpy()])
+
+            finite_mask = np.isfinite(all_scores)
+            binary_labels = binary_labels[finite_mask]
+            all_scores = all_scores[finite_mask]
+            if all_scores.size == 0 or np.unique(binary_labels).size < 2:
+                print(f"[{method}]: Skip OOD metrics (non-finite scores).")
+                continue
 
             fpr, tpr, _ = metrics.roc_curve(binary_labels, all_scores, drop_intermediate=False)
             auroc = metrics.auc(fpr, tpr)
@@ -840,6 +890,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.05)
     # BER(aux) fine-tuning용 weight decay (논문: 0.0005)
     parser.add_argument("--ber_weight_decay", type=float, default=5e-4)
+    # 안정성: NaN/Inf 방지를 위한 gradient clipping (0이면 비활성)
+    parser.add_argument("--ber_grad_clip", type=float, default=5.0)
     # 논문 설정: Cosine Annealing 사용(기본 True)
     parser.add_argument("--use_scheduler", dest="use_scheduler", action="store_true", help="Cosine annealing scheduler 사용")
     parser.add_argument("--no_scheduler", dest="use_scheduler", action="store_false", help="Scheduler 비활성화")
